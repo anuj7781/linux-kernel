@@ -7,6 +7,13 @@
 #include <linux/io_dmabuf_token.h>
 #include <linux/dma-resv.h>
 
+/*
+ * Importer revocation bookkeeping fences must not participate in implicit
+ * kernel synchronization (DMA_RESV_USAGE_KERNEL). Use BOOKKEEP so that
+ * unrelated kernel paths (e.g. KFD restore) do not wait on NVMe I/O drain.
+ */
+#define IO_DMABUF_FENCE_USAGE	DMA_RESV_USAGE_BOOKKEEP
+
 struct io_dmabuf_fence {
 	struct dma_fence base;
 	spinlock_t lock;
@@ -128,7 +135,7 @@ retry:
 	 * we'll need to wait for fences. Do a bit nicer and try to wait
 	 * without the resv lock first.
 	 */
-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
 				    true, MAX_SCHEDULE_TIMEOUT);
 	if (!ret)
 		ret = -EAGAIN;
@@ -142,8 +149,8 @@ retry:
 		goto out;
 	}
 
-	if (dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
-				  true, 0) < 0) {
+	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+				  true, 0) <= 0) {
 		dma_resv_unlock(dmabuf->resv);
 		goto retry;
 	}
@@ -189,7 +196,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
 	}
 
 	dma_resv_add_fence(dmabuf->resv, &map->fence->base,
-			   DMA_RESV_USAGE_KERNEL);
+			   IO_DMABUF_FENCE_USAGE);
 	/*
 	 * Delay destruction until all inflight requests using the map are
 	 * gone. It'll also signal the fence then.
@@ -216,7 +223,7 @@ static void io_dmabuf_token_release_work(struct work_struct *work)
 	dma_resv_unlock(dmabuf->resv);
 
 	/* Wait until all maps are destroyed. */
-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
 				    false, MAX_SCHEDULE_TIMEOUT);
 
 	if (WARN_ON_ONCE(ret <= 0))
