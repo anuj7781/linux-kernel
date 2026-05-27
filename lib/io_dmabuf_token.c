@@ -8,11 +8,20 @@
 #include <linux/dma-resv.h>
 
 /*
- * Importer revocation bookkeeping fences must not participate in implicit
- * kernel synchronization (DMA_RESV_USAGE_KERNEL). Use BOOKKEEP so that
- * unrelated kernel paths (e.g. KFD restore) do not wait on NVMe I/O drain.
+ * Token map-drain fences represent "NVMe DMA writes to this buffer have
+ * stopped". Register them at WRITE so that GPU blits moving the BO see the
+ * fence as a dependency (amdgpu_sync_resv iterates up to READ, and WRITE ≤
+ * READ), preventing a blit from reading source data while NVMe is still
+ * writing. WRITE is above KERNEL, so KFD restore's KERNEL-level fence scan
+ * does not pick up these fences and no false dependency on I/O drain is added.
  */
-#define IO_DMABUF_FENCE_USAGE	DMA_RESV_USAGE_BOOKKEEP
+#define IO_DMABUF_FENCE_USAGE		DMA_RESV_USAGE_WRITE
+
+/*
+ * Waits in the remap and release paths must drain the token fence itself, so
+ * use BOOKKEEP (broadest) which includes WRITE-level fences.
+ */
+#define IO_DMABUF_FENCE_WAIT_USAGE	DMA_RESV_USAGE_BOOKKEEP
 
 struct io_dmabuf_fence {
 	struct dma_fence base;
@@ -135,7 +144,7 @@ retry:
 	 * we'll need to wait for fences. Do a bit nicer and try to wait
 	 * without the resv lock first.
 	 */
-	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
 				    true, MAX_SCHEDULE_TIMEOUT);
 	if (!ret)
 		ret = -EAGAIN;
@@ -149,7 +158,7 @@ retry:
 		goto out;
 	}
 
-	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
 				  true, 0) <= 0) {
 		dma_resv_unlock(dmabuf->resv);
 		goto retry;
@@ -223,7 +232,7 @@ static void io_dmabuf_token_release_work(struct work_struct *work)
 	dma_resv_unlock(dmabuf->resv);
 
 	/* Wait until all maps are destroyed. */
-	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
 				    false, MAX_SCHEDULE_TIMEOUT);
 
 	if (WARN_ON_ONCE(ret <= 0))
