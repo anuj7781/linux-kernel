@@ -2,9 +2,9 @@
 #ifndef _LINUX_DMA_TOKEN_H
 #define _LINUX_DMA_TOKEN_H
 
+#include <linux/completion.h>
 #include <linux/dma-buf.h>
 
-struct io_dmabuf_fence;
 struct io_dmabuf_token;
 struct io_dmabuf_map;
 
@@ -36,8 +36,11 @@ struct io_dmabuf_map {
 	 */
 	struct percpu_ref		refs;
 
-	struct work_struct		release_work;
-	struct io_dmabuf_fence		*fence;
+	/*
+	 * Signalled by io_dmabuf_map_refs_release() when refs reach zero.
+	 * io_dmabuf_drop_map() waits on this before calling unmap.
+	 */
+	struct completion		drain;
 	struct io_dmabuf_token		*token;
 };
 
@@ -46,8 +49,6 @@ struct io_dmabuf_token {
 	struct dma_buf			*dmabuf;
 	enum dma_data_direction		dir;
 
-	atomic_t			fence_seq;
-	u64				fence_ctx;
 	struct work_struct		release_work;
 	refcount_t			refs;
 
