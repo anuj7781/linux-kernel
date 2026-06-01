@@ -49,6 +49,31 @@ config DMABUF_DEBUG
 	  exporters. Specifically it validates that importers do not peek at the
 	  underlying struct page when they import a buffer.
 
+config FAKE_GPU_DMABUF
+	tristate "Fake GPU dma-buf exporter for deadlock testing"
+	default n
+	depends on DMA_SHARED_BUFFER
+	depends on DMABUF_TOKEN
+	help
+	  A minimal dma-buf exporter that mimics the AMDGPU behaviors
+	  responsible for ABBA deadlocks in the io_uring dma-buf registered
+	  buffer path:
+
+	    - map_dma_buf() can block while the resv is held (BLOCK_MAP),
+	      reproducing ttm_bo_validate() waiting on a GPU fence.
+	    - The exporter can call dma_buf_invalidate_mappings() while holding
+	      the resv and then hold the resv further (INVAL_AND_HOLD),
+	      reproducing AMDGPU BO eviction + KFD restore behavior.
+	    - A kernel thread can hold the resv indefinitely (HOLD_RESV),
+	      reproducing drm_exec / KFD restore locking a BO resv.
+
+	  The real io_uring → io_dmabuf_token → NVMe importer path is used
+	  unchanged, so any hang produces meaningful stack traces.
+
+	  Control interface: /dev/fake_gpu_dmabuf (see fake_gpu_dmabuf.h).
+
+	  Only enable for debugging. Not for production kernels.
+
 config DMABUF_SELFTESTS
 	tristate "Selftests for the dma-buf interfaces"
 	default n
