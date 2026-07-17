@@ -345,6 +345,34 @@ struct file_attr {
 /* Get logical block metadata capability details */
 #define FS_IOC_GETLBMD_CAP		_IOWR(0x15, 2, struct logical_block_metadata_cap)
 
+struct fs_open_write_stream_id {
+	__u32		stream_id;	/* IN: stream id to open; OUT: assigned id when OPEN_ANY */
+	__u32		flags;		/* IN: FS_WRITE_STREAM_OPEN_* */
+};
+
+struct fs_set_write_stream_fd {
+	__s32		stream_fd;	/* IN: stream fd to associate with the file */
+	__u32		reserved;
+};
+
+struct fs_get_write_stream_id {
+	__u32		stream_id;	/* OUT: stream id assigned to the file */
+	__u32		reserved;
+};
+
+/*
+ * Flag to let the kernel pick any available stream id.
+ * The assigned id is returned in stream_id. Without this flag, the caller
+ * must provide a specific stream_id; fails with -EBUSY if already in use.
+ */
+#define FS_WRITE_STREAM_OPEN_ANY	(1 << 0)
+
+#define FS_IOC_QUERY_MAX_WRITE_STREAM_IDS	_IOR('f', 135, __u32)
+#define FS_IOC_OPEN_WRITE_STREAM_ID		_IOWR('f', 136, struct fs_open_write_stream_id)
+#define FS_IOC_SET_FILE_WRITE_STREAM_BY_FD	_IOW('f', 137, struct fs_set_write_stream_fd)
+#define FS_IOC_QUERY_FILE_WRITE_STREAM_ID	_IOR('f', 138, struct fs_get_write_stream_id)
+#define FS_IOC_CLEAR_FILE_WRITE_STREAM_ID	_IO('f', 139)
+
 /*
  * Inode flags (FS_IOC_GETFLAGS / FS_IOC_SETFLAGS)
  *
