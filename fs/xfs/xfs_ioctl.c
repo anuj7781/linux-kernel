@@ -4,6 +4,7 @@
  * All Rights Reserved.
  */
 #include "xfs_platform.h"
+#include <linux/fdtable.h>
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -556,6 +557,12 @@ xfs_ioctl_setattr_xflags(
 	struct xfs_mount	*mp = ip->i_mount;
 	bool			rtflag = (fa->fsx_xflags & FS_XFLAG_REALTIME);
 	uint64_t		i_flags2;
+
+	if ((fa->fsx_xflags & FS_XFLAG_FILESTREAM) && ip->i_write_stream)
+		return -EINVAL;
+
+	if (rtflag && ip->i_write_stream)
+		return -EINVAL;
 
 	if (rtflag != XFS_IS_REALTIME_INODE(ip)) {
 		/* Can't change realtime flag if any extents are allocated. */
@@ -1200,6 +1207,83 @@ xfs_ioctl_fs_counts(
 	return 0;
 }
 
+static int
+xfs_ioc_write_stream_open(
+	struct file		*filp,
+	void __user		*arg)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+	struct fs_open_write_stream_id wso;
+	int			fd;
+
+	if (copy_from_user(&wso, arg, sizeof(wso)))
+		return -EFAULT;
+
+	fd = xfs_inode_write_stream_open(ip, wso.flags, &wso.stream_id);
+	if (fd < 0)
+		return fd;
+
+	if (copy_to_user(arg, &wso, sizeof(wso))) {
+		close_fd(fd);
+		return -EFAULT;
+	}
+	return fd;
+}
+
+static int
+xfs_ioc_write_stream_set(
+	struct file		*filp,
+	void __user		*arg)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+	struct fs_set_write_stream_fd wss;
+
+	if (!(filp->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (copy_from_user(&wss, arg, sizeof(wss)))
+		return -EFAULT;
+	return xfs_inode_set_write_stream(ip, wss.stream_fd);
+}
+
+static int
+xfs_ioc_write_stream_get(
+	struct xfs_inode	*ip,
+	void __user		*arg)
+{
+	struct fs_get_write_stream_id wsg = {
+		.stream_id = xfs_inode_get_write_stream(ip),
+	};
+
+	if (copy_to_user(arg, &wsg, sizeof(wsg)))
+		return -EFAULT;
+	return 0;
+}
+
+static int
+xfs_ioc_write_stream_clear(
+	struct file		*filp)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+
+	if (!(filp->f_mode & FMODE_WRITE))
+		return -EBADF;
+	return xfs_inode_clear_write_stream(ip);
+}
+
+static int
+xfs_ioc_write_stream_get_max(
+	struct xfs_inode	*ip,
+	void __user		*arg)
+{
+	__u32 nr_streams;
+
+	xfs_ilock(ip, XFS_ILOCK_SHARED);
+	nr_streams = xfs_inode_max_write_streams(ip);
+	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+
+	return put_user(nr_streams, (__u32 __user *)arg);
+}
+
 /*
  * These long-unused ioctls were removed from the official ioctl API in 5.17,
  * but retain these definitions so that we can log warnings about them.
@@ -1465,6 +1549,18 @@ xfs_file_ioctl(
 		return xfs_ioc_health_monitor(filp, arg);
 	case XFS_IOC_VERIFY_MEDIA:
 		return xfs_ioc_verify_media(filp, arg);
+	case FS_IOC_OPEN_WRITE_STREAM_ID:
+		return xfs_ioc_write_stream_open(filp, (void __user *)arg);
+	case FS_IOC_SET_FILE_WRITE_STREAM_BY_FD:
+		return xfs_ioc_write_stream_set(filp, (void __user *)arg);
+	case FS_IOC_QUERY_FILE_WRITE_STREAM_ID:
+		return xfs_ioc_write_stream_get(XFS_I(file_inode(filp)),
+						(void __user *)arg);
+	case FS_IOC_QUERY_MAX_WRITE_STREAM_IDS:
+		return xfs_ioc_write_stream_get_max(XFS_I(file_inode(filp)),
+						    (void __user *)arg);
+	case FS_IOC_CLEAR_FILE_WRITE_STREAM_ID:
+		return xfs_ioc_write_stream_clear(filp);
 
 	default:
 		return -ENOTTY;
