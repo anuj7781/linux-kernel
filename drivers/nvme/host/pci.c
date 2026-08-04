@@ -405,6 +405,8 @@ struct nvme_dmabuf_map {
 	struct dma_buf_io_map base;
 	struct sg_table *sgt;
 	unsigned nr_entries;
+	__le64 *prp_array;
+	dma_addr_t prp_array_dma;
 	dma_addr_t dma_list[];
 };
 
@@ -964,6 +966,25 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 	if (length <= NVME_CTRL_PAGE_SIZE) {
 		prp2_dma = dma_list[map_idx];
 		goto done;
+	}
+
+	/*
+	 * The precomputed prp_array has no chain pointers, so a slice of it
+	 * can only be used directly as PRP2 if the whole slice this request
+	 * needs lies within a single physical page of the array.
+	 */
+	if (map->prp_array) {
+		unsigned int nprps = DIV_ROUND_UP(length, NVME_CTRL_PAGE_SIZE);
+		dma_addr_t prp_list_start = map->prp_array_dma +
+				map_idx * sizeof(*map->prp_array);
+		dma_addr_t prp_list_end = prp_list_start +
+				nprps * sizeof(*map->prp_array);
+
+		if ((prp_list_start >> NVME_CTRL_PAGE_SHIFT) ==
+		    ((prp_list_end - 1) >> NVME_CTRL_PAGE_SHIFT)) {
+			prp2_dma = prp_list_start;
+			goto done;
+		}
 	}
 
 	if (DIV_ROUND_UP(length, NVME_CTRL_PAGE_SIZE) <=
@@ -2620,6 +2641,21 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 	if (!map)
 		return ERR_PTR(-ENOMEM);
 
+	/*
+	 * Precomputed PRP list for the whole dmabuf, so I/O whose PRP list
+	 * fits in a single page can point directly into it instead of
+	 * allocating a fresh page from the per-NUMA descriptor pool on every
+	 * I/O. Purely an optimization: cap the size defensively regardless
+	 * of the io_uring-side dmabuf size limit, and treat any failure to
+	 * allocate as non-fatal, falling back to the descriptor pool path.
+	 */
+	if (nr_entries * sizeof(*map->prp_array) <= SZ_4M)
+		map->prp_array = dma_alloc_coherent(attach->dev,
+					    nr_entries * sizeof(*map->prp_array),
+					    &map->prp_array_dma, GFP_KERNEL);
+	else
+		map->prp_array = NULL;
+
 	sgt = dma_buf_map_attachment(attach, ctx->dir);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
@@ -2636,7 +2672,10 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 			goto err;
 		}
 		while (sg_len) {
-			map->dma_list[i++] = dma_addr;
+			map->dma_list[i] = dma_addr;
+			if (map->prp_array)
+				map->prp_array[i] = cpu_to_le64(dma_addr);
+			i++;
 			dma_addr += NVME_CTRL_PAGE_SIZE;
 			sg_len -= NVME_CTRL_PAGE_SIZE;
 		}
@@ -2651,6 +2690,10 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 err:
 	if (sgt)
 		dma_buf_unmap_attachment(attach, sgt, ctx->dir);
+	if (map->prp_array)
+		dma_free_coherent(attach->dev,
+				  nr_entries * sizeof(*map->prp_array),
+				  map->prp_array, map->prp_array_dma);
 	kfree(map);
 	return ERR_PTR(ret);
 }
@@ -2663,6 +2706,10 @@ static void nvme_dma_buf_io_unmap(struct dma_buf_io_ctx *ctx,
 
 	dma_resv_assert_held(ctx->dmabuf->resv);
 
+	if (map->prp_array)
+		dma_free_coherent(nvme_ctx->attach->dev,
+				  map->nr_entries * sizeof(*map->prp_array),
+				  map->prp_array, map->prp_array_dma);
 	dma_buf_unmap_attachment(nvme_ctx->attach, map->sgt, ctx->dir);
 }
 
