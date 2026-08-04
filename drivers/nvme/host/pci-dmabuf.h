@@ -27,6 +27,8 @@ struct nvme_dmabuf_map {
 	struct dma_buf_io_map base;
 	struct sg_table *sgt;
 	unsigned nr_entries;
+	__le64 *prp_array;
+	dma_addr_t prp_array_dma;
 	dma_addr_t dma_list[] __counted_by(nr_entries);
 };
 

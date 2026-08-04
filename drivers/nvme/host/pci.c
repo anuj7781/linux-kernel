@@ -893,6 +893,21 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 		goto done;
 	}
 
+	/* A direct PRP-list slice must not cross a controller page. */
+	if (map->prp_array && !blk_rq_is_passthrough(req)) {
+		unsigned int nprps = DIV_ROUND_UP(length,
+						   NVME_CTRL_PAGE_SIZE);
+		dma_addr_t start = map->prp_array_dma +
+				   map_idx * sizeof(*map->prp_array);
+		dma_addr_t end = start + nprps * sizeof(*map->prp_array);
+
+		if ((start >> NVME_CTRL_PAGE_SHIFT) ==
+		    ((end - 1) >> NVME_CTRL_PAGE_SHIFT)) {
+			prp2_dma = start;
+			goto done;
+		}
+	}
+
 	if (DIV_ROUND_UP(length, NVME_CTRL_PAGE_SIZE) <=
 	    NVME_SMALL_POOL_SIZE / sizeof(__le64))
 		iod->flags |= IOD_SMALL_DESCRIPTOR;

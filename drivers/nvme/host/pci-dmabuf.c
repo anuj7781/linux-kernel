@@ -28,6 +28,7 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 	struct nvme_dmabuf_map *map;
 	struct scatterlist *sg;
 	struct sg_table *sgt;
+	size_t prp_array_size;
 	int ret;
 
 	dma_resv_assert_held(ctx->dmabuf->resv);
@@ -39,6 +40,13 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 	if (!map)
 		return ERR_PTR(-ENOMEM);
 	map->nr_entries = nr_entries;
+	map->prp_array = NULL;
+	prp_array_size = array_size(nr_entries, sizeof(*map->prp_array));
+	if (prp_array_size <= SZ_4M)
+		map->prp_array = dma_alloc_coherent(attach->dev,
+						    prp_array_size,
+						    &map->prp_array_dma,
+						    GFP_KERNEL | __GFP_NOWARN);
 
 	sgt = dma_buf_map_attachment(attach, ctx->dir);
 	if (IS_ERR(sgt)) {
@@ -57,7 +65,10 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 			goto err;
 		}
 		while (sg_len) {
-			map->dma_list[i++] = dma_addr;
+			map->dma_list[i] = dma_addr;
+			if (map->prp_array)
+				map->prp_array[i] = cpu_to_le64(dma_addr);
+			i++;
 			dma_addr += NVME_CTRL_PAGE_SIZE;
 			sg_len -= NVME_CTRL_PAGE_SIZE;
 		}
@@ -71,6 +82,9 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 err:
 	if (sgt)
 		dma_buf_unmap_attachment(attach, sgt, ctx->dir);
+	if (map->prp_array)
+		dma_free_coherent(attach->dev, prp_array_size,
+				  map->prp_array, map->prp_array_dma);
 	kvfree(map);
 	return ERR_PTR(ret);
 }
@@ -83,6 +97,11 @@ static void nvme_dma_buf_io_unmap(struct dma_buf_io_ctx *ctx,
 
 	dma_resv_assert_held(ctx->dmabuf->resv);
 
+	if (map->prp_array)
+		dma_free_coherent(nvme_ctx->attach->dev,
+				  array_size(map->nr_entries,
+					     sizeof(*map->prp_array)),
+				  map->prp_array, map->prp_array_dma);
 	dma_buf_unmap_attachment(nvme_ctx->attach, map->sgt, ctx->dir);
 	kvfree(map);
 }
