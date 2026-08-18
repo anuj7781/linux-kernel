@@ -2160,6 +2160,35 @@ xfs_rtallocate_align(
 	return 0;
 }
 
+/*
+ * Return a bno_hint biased toward the RTG set that corresponds to the
+ * inode's write stream, analogous to AG-set steering for the data device.
+ * Only called when RTgroups are present and the inode has a write stream.
+ */
+static xfs_rtblock_t
+xfs_inode_write_stream_rtg_hint(
+	struct xfs_inode	*ip)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+	uint32_t		nr_streams = mp->m_rt_stream_count;
+	uint32_t		stream_id = ip->i_write_stream - 1;	/* 0-based */
+	xfs_rgnumber_t		nr_rtgs = mp->m_sb.sb_rgcount;
+	xfs_rgnumber_t		target_rgno, set_size;
+
+	set_size = nr_rtgs / nr_streams;
+	if (set_size) {
+		target_rgno = stream_id * set_size;
+		/* fan within the set using low bits of the inode number */
+		target_rgno += (uint32_t)(I_INO(ip) % set_size);
+		if (target_rgno >= nr_rtgs)
+			target_rgno = nr_rtgs - 1;
+	} else {
+		/* fewer RTGs than streams: round-robin */
+		target_rgno = stream_id % nr_rtgs;
+	}
+	return ((xfs_rtblock_t)target_rgno) << mp->m_groups[XG_TYPE_RTG].blklog;
+}
+
 int
 xfs_bmap_rtalloc(
 	struct xfs_bmalloca	*ap)
@@ -2185,6 +2214,8 @@ retry:
 
 	if (xfs_bmap_adjacent(ap))
 		bno_hint = ap->blkno;
+	else if (ap->ip->i_write_stream && xfs_has_rtgroups(ap->ip->i_mount))
+		bno_hint = xfs_inode_write_stream_rtg_hint(ap->ip);
 
 	if (xfs_has_rtgroups(ap->ip->i_mount)) {
 		error = xfs_rtallocate_rtgs(ap->tp, bno_hint, raminlen, ralen,

@@ -1652,6 +1652,48 @@ xfs_debugfs_mkdir(
 	return child;
 }
 
+static void
+xfs_init_rt_streams(
+	struct xfs_mount	*mp,
+	unsigned int		data_bitmap_size)
+{
+	unsigned int		nr_streams;
+	xfs_rgnumber_t		nr_rtgs, rtg_set_size;
+
+	if (!mp->m_rtdev_targp || !xfs_has_realtime(mp) || xfs_has_zoned(mp)) {
+		mp->m_rt_stream_base = mp->m_rt_stream_count = 0;
+		return;
+	}
+
+	nr_streams = bdev_max_write_streams(mp->m_rtdev_targp->bt_bdev);
+
+	if (nr_streams) {
+		/* FDP capable RT device: RT slots follow data slots in the bitmap */
+		mp->m_rt_stream_base = data_bitmap_size;
+		mp->m_rt_stream_count = nr_streams;
+		return;
+	}
+
+	/* No FDP: software streams only when RTgroups are present */
+	if (!xfs_has_rtgroups(mp)) {
+		mp->m_rt_stream_base = mp->m_rt_stream_count = 0;
+		return;
+	}
+
+	nr_rtgs = mp->m_sb.sb_rgcount;
+	if (nr_rtgs >= 16)
+		rtg_set_size = 4;
+	else if (nr_rtgs >= 8)
+		rtg_set_size = 2;
+	else
+		rtg_set_size = 1;
+	nr_streams = min_t(unsigned int, nr_rtgs / rtg_set_size,
+			   XFS_SW_WRITE_STREAMS_MAX);
+
+	mp->m_rt_stream_base = data_bitmap_size;
+	mp->m_rt_stream_count = nr_streams;
+}
+
 static int
 xfs_fs_fill_super(
 	struct super_block	*sb,
@@ -1713,6 +1755,8 @@ xfs_fs_fill_super(
 	nr_streams = bdev_max_write_streams(mp->m_ddev_targp->bt_bdev);
 	if (!nr_streams)
 		nr_streams = XFS_SW_WRITE_STREAMS_MAX;
+	xfs_init_rt_streams(mp, nr_streams);
+	nr_streams = max(nr_streams, mp->m_rt_stream_base + mp->m_rt_stream_count);
 	mp->m_streams_in_use = bitmap_zalloc(nr_streams, GFP_KERNEL);
 	if (!mp->m_streams_in_use) {
 		error = -ENOMEM;

@@ -3248,7 +3248,7 @@ xfs_ag_to_ag_set(
 	if (!(ap->datatype & XFS_ALLOC_USERDATA))
 		return base_agno;
 
-	if (ip->i_write_stream)
+	if (ip->i_write_stream && !XFS_IS_REALTIME_INODE(ip))
 		set_size = xfs_inode_write_stream_ag_set(ip, &base_agno);
 	else
 		set_size = xfs_default_ag_set_size(ip);

@@ -354,6 +354,8 @@ typedef struct xfs_mount {
 
 	unsigned long		*m_streams_in_use;
 	spinlock_t		m_streams_lock;
+	unsigned int		m_rt_stream_base;  /* bitmap offset for RT streams */
+	unsigned int		m_rt_stream_count; /* number of RT streams (0 if none) */
 } xfs_mount_t;
 
 #define M_IGEO(mp)		(&(mp)->m_ino_geo)

@@ -62,8 +62,11 @@ xfs_inode_max_write_streams(
 	if (xfs_inode_is_filestream(ip))
 		return 0;
 
+	if (XFS_IS_REALTIME_INODE(ip))
+		return mp->m_rt_stream_count;
+
 	bdev = xfs_inode_buftarg(ip)->bt_bdev;
-	if (!bdev || XFS_IS_REALTIME_INODE(ip))
+	if (!bdev)
 		return 0;
 
 	nr_streams = bdev_max_write_streams(bdev);
@@ -101,7 +104,8 @@ xfs_inode_get_write_stream(
 
 struct xfs_write_stream {
 	struct xfs_mount	*mp;
-	uint16_t		stream_id;	/* 1-based */
+	uint16_t		stream_id;	/* 1-based, user-visible */
+	bool			is_rt;		/* drawn from RT stream pool */
 };
 
 static int
@@ -113,7 +117,8 @@ xfs_write_stream_release(
 	struct xfs_mount	*mp = ws->mp;
 
 	spin_lock(&mp->m_streams_lock);
-	clear_bit(ws->stream_id - 1, mp->m_streams_in_use);
+	clear_bit((ws->is_rt ? mp->m_rt_stream_base : 0) + ws->stream_id - 1,
+		  mp->m_streams_in_use);
 	spin_unlock(&mp->m_streams_lock);
 	kfree(ws);
 	return 0;
@@ -132,6 +137,8 @@ xfs_inode_write_stream_open(
 {
 	struct xfs_mount	*mp = ip->i_mount;
 	struct xfs_write_stream	*ws;
+	bool			is_rt = XFS_IS_REALTIME_INODE(ip);
+	unsigned int		base;
 	int			max, slot, fd, ret;
 
 	if (flags & ~FS_WRITE_STREAM_OPEN_ANY)
@@ -144,14 +151,16 @@ xfs_inode_write_stream_open(
 		return -EOPNOTSUPP;
 	ASSERT(mp->m_streams_in_use);
 
+	base = is_rt ? mp->m_rt_stream_base : 0;
+
 	ws = kmalloc(sizeof(*ws), GFP_KERNEL);
 	if (!ws)
 		return -ENOMEM;
 
 	spin_lock(&mp->m_streams_lock);
 	if (flags & FS_WRITE_STREAM_OPEN_ANY) {
-		slot = find_first_zero_bit(mp->m_streams_in_use, max);
-		if (slot >= max) {
+		slot = find_next_zero_bit(mp->m_streams_in_use, base + max, base);
+		if (slot >= base + max) {
 			ret = -EBUSY;
 			goto out_unlock;
 		}
@@ -160,7 +169,7 @@ xfs_inode_write_stream_open(
 			ret = -EINVAL;
 			goto out_unlock;
 		}
-		slot = *stream_idp - 1;
+		slot = base + *stream_idp - 1;
 		if (test_bit(slot, mp->m_streams_in_use)) {
 			ret = -EBUSY;
 			goto out_unlock;
@@ -170,7 +179,8 @@ xfs_inode_write_stream_open(
 	spin_unlock(&mp->m_streams_lock);
 
 	ws->mp = mp;
-	ws->stream_id = slot + 1;	/* convert to 1-based */
+	ws->stream_id = slot - base + 1;	/* user-visible 1-based */
+	ws->is_rt = is_rt;
 
 	fd = anon_inode_getfd("[xfs_write_stream]", &xfs_write_stream_fops, ws,
 			      O_RDONLY | O_CLOEXEC);
@@ -208,10 +218,13 @@ xfs_inode_set_write_stream(
 	ws = fd_file(f)->private_data;
 	if (ws->mp != ip->i_mount)
 		return -EINVAL;
+	/* prevent cross-device assignment: RT stream fd on data file or vice versa */
+	if (ws->is_rt != XFS_IS_REALTIME_INODE(ip))
+		return -EINVAL;
 
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 
-	if (XFS_IS_REALTIME_INODE(ip) || xfs_inode_is_filestream(ip) ||
+	if (xfs_inode_is_filestream(ip) ||
 	    VFS_I(ip)->i_write_hint != WRITE_LIFE_NOT_SET) {
 		ret = -EINVAL;
 		goto out_unlock;
