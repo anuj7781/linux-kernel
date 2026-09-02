@@ -4,6 +4,7 @@
  * All Rights Reserved.
  */
 #include <linux/iversion.h>
+#include <linux/write_streams.h>
 
 #include "xfs_platform.h"
 #include "xfs_fs.h"
@@ -46,6 +47,87 @@
 #include "xfs_metafile.h"
 
 struct kmem_cache *xfs_inode_cache;
+
+/*
+ * Return the number of write streams available for this inode.
+ *
+ * The stream count is derived from the AG topology at mount time and cached
+ * in the buftarg stream pool, so this is a fast read.
+ *
+ * Write streams and the filestream allocator both steer allocation locality
+ * and are mutually exclusive.  Realtime inodes are excluded because the RT
+ * device is managed separately.
+ *
+ * Called with the inode lock held (shared or exclusive) so that i_diflags
+ * reads are stable.
+ */
+int
+xfs_inode_max_write_streams(
+	struct xfs_inode	*ip)
+{
+	xfs_assert_ilocked(ip, XFS_ILOCK_SHARED | XFS_ILOCK_EXCL);
+
+	if (xfs_inode_is_filestream(ip))
+		return 0;
+	if (XFS_IS_REALTIME_INODE(ip))
+		return 0;
+
+	return ip->i_mount->m_ddev_targp->bt_stream_pool.nr_streams;
+}
+
+/*
+ * Bind the write stream identified by @stream_fd to @ip.
+ *
+ * Validates that the fd is a write stream, that it belongs to the same
+ * filesystem as the inode, and that the inode has no conflicting placement
+ * hints (write-life-time hint, filestream flag, or realtime flag).
+ */
+int
+xfs_inode_set_write_stream(
+	struct xfs_inode	*ip,
+	int			stream_fd)
+{
+	CLASS(fd, f)(stream_fd);
+	struct xfs_buftarg	*target = ip->i_mount->m_ddev_targp;
+	int			error = 0;
+
+	if (!fd_file(f))
+		return -EBADF;
+	if (!write_stream_file_check(fd_file(f), &target->bt_stream_pool))
+		return -EINVAL;
+
+	xfs_ilock(ip, XFS_ILOCK_EXCL);
+
+	/* Filestream and write-stream placement are mutually exclusive. */
+	if (xfs_inode_is_filestream(ip)) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+
+	/* Write streams on realtime inodes are not supported. */
+	if (XFS_IS_REALTIME_INODE(ip)) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+
+	/*
+	 * A write stream steers allocation locality; a write-life-time hint
+	 * (fcntl F_SET_RW_HINT) steers write placement on FDP/zoned devices.
+	 * The two are mutually exclusive.  Use i_lock to make the check-and-set
+	 * atomic against fcntl_set_rw_hint(), which also holds i_lock.
+	 */
+	spin_lock(&VFS_I(ip)->i_lock);
+	if (VFS_I(ip)->i_write_hint != WRITE_LIFE_NOT_SET) {
+		spin_unlock(&VFS_I(ip)->i_lock);
+		error = -EBUSY;
+		goto out_unlock;
+	}
+	WRITE_ONCE(VFS_I(ip)->i_write_stream, write_stream_get_id(fd_file(f)));
+	spin_unlock(&VFS_I(ip)->i_lock);
+out_unlock:
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+	return error;
+}
 
 /*
  * These two are wrapper routines around the xfs_ilock() routine used to

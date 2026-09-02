@@ -557,6 +557,18 @@ xfs_ioctl_setattr_xflags(
 	bool			rtflag = (fa->fsx_xflags & FS_XFLAG_REALTIME);
 	uint64_t		i_flags2;
 
+	/*
+	 * Filestream and write-stream placement are mutually exclusive; the
+	 * inverse (write-stream already set, then chattr +f or +r) is checked
+	 * here since this inode is already ILOCK_EXCL at this point.
+	 */
+	if ((fa->fsx_xflags & FS_XFLAG_FILESTREAM) &&
+	    READ_ONCE(VFS_I(ip)->i_write_stream))
+		return -EINVAL;
+
+	if (rtflag && READ_ONCE(VFS_I(ip)->i_write_stream))
+		return -EINVAL;
+
 	if (rtflag != XFS_IS_REALTIME_INODE(ip)) {
 		/* Can't change realtime flag if any extents are allocated. */
 		if (xfs_inode_has_filedata(ip))
@@ -1200,6 +1212,60 @@ xfs_ioctl_fs_counts(
 	return 0;
 }
 
+static int
+xfs_ioc_write_stream_get_max(
+	struct file		*filp,
+	void __user		*arg)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+	struct fs_write_stream_get_max get_max = { };
+
+	xfs_ilock(ip, XFS_ILOCK_SHARED);
+	get_max.max_streams = xfs_inode_max_write_streams(ip);
+	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+
+	if (copy_to_user(arg, &get_max, sizeof(get_max)))
+		return -EFAULT;
+	return 0;
+}
+
+static int
+xfs_ioc_write_stream_alloc(
+	struct file		*filp)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+	struct xfs_buftarg	*target = ip->i_mount->m_ddev_targp;
+	int			max;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	xfs_ilock(ip, XFS_ILOCK_SHARED);
+	max = xfs_inode_max_write_streams(ip);
+	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+
+	if (!max)
+		return -EOPNOTSUPP;
+	return write_stream_alloc_fd(&target->bt_stream_pool, filp);
+}
+
+static int
+xfs_ioc_write_stream_set(
+	struct file		*filp,
+	void __user		*arg)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+	struct fs_write_stream_set set;
+
+	if (!(filp->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (copy_from_user(&set, arg, sizeof(set)))
+		return -EFAULT;
+	if (set.reserved)
+		return -EINVAL;
+	return xfs_inode_set_write_stream(ip, set.stream_fd);
+}
+
 /*
  * These long-unused ioctls were removed from the official ioctl API in 5.17,
  * but retain these definitions so that we can log warnings about them.
@@ -1465,6 +1531,13 @@ xfs_file_ioctl(
 		return xfs_ioc_health_monitor(filp, arg);
 	case XFS_IOC_VERIFY_MEDIA:
 		return xfs_ioc_verify_media(filp, arg);
+
+	case FS_IOC_WRITE_STREAM_GET_MAX:
+		return xfs_ioc_write_stream_get_max(filp, arg);
+	case FS_IOC_WRITE_STREAM_ALLOC:
+		return xfs_ioc_write_stream_alloc(filp);
+	case FS_IOC_WRITE_STREAM_SET:
+		return xfs_ioc_write_stream_set(filp, (void __user *)arg);
 
 	default:
 		return -ENOTTY;

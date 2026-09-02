@@ -673,4 +673,7 @@ int xfs_icreate_dqalloc(const struct xfs_icreate_args *args,
 		struct xfs_dquot **udqpp, struct xfs_dquot **gdqpp,
 		struct xfs_dquot **pdqpp);
 
+int xfs_inode_max_write_streams(struct xfs_inode *ip);
+int xfs_inode_set_write_stream(struct xfs_inode *ip, int stream_fd);
+
 #endif	/* __XFS_INODE_H__ */
