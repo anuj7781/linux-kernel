@@ -3579,8 +3579,46 @@ out_low_space:
 	return xfs_bmap_btalloc_low_space(ap, args);
 }
 
+/*
+ * Compute the first AG in the allocation group set for the write stream
+ * assigned to this inode.
+ *
+ * AGs are divided evenly among streams; the last stream absorbs any remainder.
+ * Low bits of the inode number fan out within the stream's set to reduce
+ * AGF lock contention among concurrent writers sharing the same stream.
+ *
+ * Because nr_streams <= sb_agcount is guaranteed by xfs_sw_write_stream_count(),
+ * ag_set_size >= 1 is always satisfied without a streams > AGs fallback.
+ */
+static xfs_agnumber_t
+xfs_bmap_write_stream_agno(
+	struct xfs_inode	*ip)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+	xfs_agnumber_t		nr_ags = mp->m_sb.sb_agcount;
+	unsigned int		nr_streams = mp->m_ddev_targp->bt_stream_pool.nr_streams;
+	unsigned int		stream_id = READ_ONCE(VFS_I(ip)->i_write_stream);
+	xfs_agnumber_t		ag_set_size, start_agno;
+
+	stream_id -= 1;	/* convert from 1-based to 0-based */
+	ag_set_size = nr_ags / nr_streams;
+	start_agno = stream_id * ag_set_size;
+
+	/* last stream absorbs any uneven remainder */
+	if (stream_id == nr_streams - 1)
+		ag_set_size = nr_ags - start_agno;
+
+	return (start_agno + XFS_INO_TO_AGINO(mp, I_INO(ip)) % ag_set_size) %
+		nr_ags;
+}
+
+/*
+ * Core AG-based allocator: select lengths, try EOF placement, try start-AG,
+ * fall back to low-space.  ap->blkno must be set to the target AG start by
+ * the caller before invoking this helper.
+ */
 static int
-xfs_bmap_btalloc_best_length(
+xfs_bmap_btalloc_from_blkno(
 	struct xfs_bmalloca	*ap,
 	struct xfs_alloc_arg	*args,
 	int			stripe_align)
@@ -3588,7 +3626,6 @@ xfs_bmap_btalloc_best_length(
 	xfs_extlen_t		blen = 0;
 	int			error;
 
-	ap->blkno = XFS_INODE_TO_FSB(ap->ip);
 	if (!xfs_bmap_adjacent(ap))
 		ap->eof = false;
 
@@ -3619,6 +3656,36 @@ xfs_bmap_btalloc_best_length(
 		return error;
 
 	return xfs_bmap_btalloc_low_space(ap, args);
+}
+
+/*
+ * Allocate blocks for a write-stream file.
+ *
+ * The starting AG is derived from the write stream ID so that distinct streams
+ * land in distinct AG sets, providing spatial isolation between concurrent
+ * writers.  Within the stream's AG set, low bits of the inode number fan out
+ * allocations to reduce AGF lock contention.
+ */
+static int
+xfs_bmap_btalloc_write_stream(
+	struct xfs_bmalloca	*ap,
+	struct xfs_alloc_arg	*args,
+	int			stripe_align)
+{
+	struct xfs_mount	*mp = ap->ip->i_mount;
+
+	ap->blkno = XFS_AGB_TO_FSB(mp, xfs_bmap_write_stream_agno(ap->ip), 0);
+	return xfs_bmap_btalloc_from_blkno(ap, args, stripe_align);
+}
+
+static int
+xfs_bmap_btalloc_best_length(
+	struct xfs_bmalloca	*ap,
+	struct xfs_alloc_arg	*args,
+	int			stripe_align)
+{
+	ap->blkno = XFS_INODE_TO_FSB(ap->ip);
+	return xfs_bmap_btalloc_from_blkno(ap, args, stripe_align);
 }
 
 static int
@@ -3657,6 +3724,9 @@ xfs_bmap_btalloc(
 	else if ((ap->datatype & XFS_ALLOC_USERDATA) &&
 			xfs_inode_is_filestream(ap->ip))
 		error = xfs_bmap_btalloc_filestreams(ap, &args, stripe_align);
+	else if ((ap->datatype & XFS_ALLOC_USERDATA) &&
+			READ_ONCE(VFS_I(ap->ip)->i_write_stream))
+		error = xfs_bmap_btalloc_write_stream(ap, &args, stripe_align);
 	else
 		error = xfs_bmap_btalloc_best_length(ap, &args, stripe_align);
 	if (error)
