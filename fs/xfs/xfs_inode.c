@@ -51,12 +51,10 @@ struct kmem_cache *xfs_inode_cache;
 /*
  * Return the number of write streams available for this inode.
  *
- * The stream count is derived from the AG topology at mount time and cached
- * in the buftarg stream pool, so this is a fast read.
+ * The stream count is cached in the inode's buftarg stream pool.
  *
  * Write streams and the filestream allocator both steer allocation locality
- * and are mutually exclusive.  Realtime inodes are excluded because the RT
- * device is managed separately.
+ * and are mutually exclusive.
  *
  * Called with the inode lock held (shared or exclusive) so that i_diflags
  * reads are stable.
@@ -69,10 +67,9 @@ xfs_inode_max_write_streams(
 
 	if (xfs_inode_is_filestream(ip))
 		return 0;
-	if (XFS_IS_REALTIME_INODE(ip))
+	if (XFS_IS_REALTIME_INODE(ip) && xfs_has_zoned(ip->i_mount))
 		return 0;
-
-	return ip->i_mount->m_ddev_targp->bt_stream_pool.nr_streams;
+	return xfs_inode_buftarg(ip)->bt_stream_pool.nr_streams;
 }
 
 /*
@@ -80,7 +77,7 @@ xfs_inode_max_write_streams(
  *
  * Validates that the fd is a write stream, that it belongs to the same
  * filesystem as the inode, and that the inode has no conflicting placement
- * hints (write-life-time hint, filestream flag, or realtime flag).
+ * hints (write-life-time hint or filestream flag).
  */
 int
 xfs_inode_set_write_stream(
@@ -88,24 +85,24 @@ xfs_inode_set_write_stream(
 	int			stream_fd)
 {
 	CLASS(fd, f)(stream_fd);
-	struct xfs_buftarg	*target = ip->i_mount->m_ddev_targp;
+	struct xfs_buftarg	*target;
 	int			error = 0;
 
 	if (!fd_file(f))
 		return -EBADF;
-	if (!write_stream_file_check(fd_file(f), &target->bt_stream_pool))
-		return -EINVAL;
-
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
-
-	/* Filestream and write-stream placement are mutually exclusive. */
-	if (xfs_inode_is_filestream(ip)) {
+	if (XFS_IS_REALTIME_INODE(ip) && xfs_has_zoned(ip->i_mount)) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	target = xfs_inode_buftarg(ip);
+	if (!write_stream_file_check(fd_file(f), &target->bt_stream_pool)) {
 		error = -EINVAL;
 		goto out_unlock;
 	}
 
-	/* Write streams on realtime inodes are not supported. */
-	if (XFS_IS_REALTIME_INODE(ip)) {
+	/* Filestream and write-stream placement are mutually exclusive. */
+	if (xfs_inode_is_filestream(ip)) {
 		error = -EINVAL;
 		goto out_unlock;
 	}

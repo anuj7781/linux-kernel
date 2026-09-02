@@ -566,7 +566,8 @@ xfs_ioctl_setattr_xflags(
 	    READ_ONCE(VFS_I(ip)->i_write_stream))
 		return -EINVAL;
 
-	if (rtflag && READ_ONCE(VFS_I(ip)->i_write_stream))
+	if (rtflag != XFS_IS_REALTIME_INODE(ip) &&
+	    READ_ONCE(VFS_I(ip)->i_write_stream))
 		return -EINVAL;
 
 	if (rtflag != XFS_IS_REALTIME_INODE(ip)) {
@@ -1234,7 +1235,7 @@ xfs_ioc_write_stream_alloc(
 	struct file		*filp)
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(filp));
-	struct xfs_buftarg	*target = ip->i_mount->m_ddev_targp;
+	struct xfs_buftarg	*target;
 	int			max;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -1242,6 +1243,7 @@ xfs_ioc_write_stream_alloc(
 
 	xfs_ilock(ip, XFS_ILOCK_SHARED);
 	max = xfs_inode_max_write_streams(ip);
+	target = xfs_inode_buftarg(ip);
 	xfs_iunlock(ip, XFS_ILOCK_SHARED);
 
 	if (!max)

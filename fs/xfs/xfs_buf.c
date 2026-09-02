@@ -1666,44 +1666,41 @@ xfs_configure_buftarg_atomic_writes(
 }
 
 /*
- * Derive a software write stream count from the AG topology.
+ * Derive a software write stream count from an allocation group topology.
  *
  * Larger filesystems get wider fanout so that allocations from different
- * streams land in distinct AG sets.  The count is bounded by the AG count
- * (no more streams than AGs) and capped at XFS_MAX_SW_WRITE_STREAMS to
- * keep the bitmap small.
+ * streams land in distinct group sets.  The count is bounded by the group
+ * count and capped at XFS_MAX_SW_WRITE_STREAMS.
  */
 #define XFS_MAX_SW_WRITE_STREAMS	16u
 
 static unsigned int
 xfs_sw_write_stream_count(
-	struct xfs_mount	*mp)
+	unsigned int		nr_groups)
 {
-	xfs_agnumber_t		nr_ags = mp->m_sb.sb_agcount;
-	unsigned int		ag_set_size;
+	unsigned int		group_set_size;
 
-	if (nr_ags >= 16)
-		ag_set_size = 4;
-	else if (nr_ags >= 8)
-		ag_set_size = 2;
+	if (nr_groups >= 16)
+		group_set_size = 4;
+	else if (nr_groups >= 8)
+		group_set_size = 2;
 	else
-		ag_set_size = 1;
-	return min(nr_ags / ag_set_size, XFS_MAX_SW_WRITE_STREAMS);
+		group_set_size = 1;
+	return min(nr_groups / group_set_size, XFS_MAX_SW_WRITE_STREAMS);
 }
 
 /*
  * Initialize the write stream pool for a buffer target.
  *
- * Must only be called for the data device buftarg after the superblock is
- * read (so sb_agcount is valid).  Log and realtime buftargs are left with a
- * zero-initialized pool, which write_stream_pool_destroy() can safely free.
+ * Must be called after the superblock geometry is available.
  */
 int
 xfs_buftarg_init_streams(
-	struct xfs_buftarg	*btp)
+	struct xfs_buftarg	*btp,
+	unsigned int		nr_groups)
 {
 	return write_stream_pool_init(&btp->bt_stream_pool,
-				      xfs_sw_write_stream_count(btp->bt_mount));
+			xfs_sw_write_stream_count(nr_groups));
 }
 
 /* Configure a buffer target that abstracts a block device. */

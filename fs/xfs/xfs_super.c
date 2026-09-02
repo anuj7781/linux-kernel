@@ -562,7 +562,8 @@ xfs_setup_devices(
 	if (error)
 		return error;
 
-	error = xfs_buftarg_init_streams(mp->m_ddev_targp);
+	error = xfs_buftarg_init_streams(mp->m_ddev_targp,
+			mp->m_sb.sb_agcount);
 	if (error)
 		return error;
 
@@ -589,6 +590,13 @@ xfs_setup_devices(
 				mp->m_sb.sb_sectsize, mp->m_sb.sb_rblocks);
 		if (error)
 			return error;
+
+		if (xfs_has_rtgroups(mp) && !xfs_has_zoned(mp)) {
+			error = xfs_buftarg_init_streams(mp->m_rtdev_targp,
+					mp->m_sb.sb_rgcount);
+			if (error)
+				return error;
+		}
 	}
 
 	return 0;
