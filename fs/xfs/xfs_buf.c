@@ -1699,8 +1699,18 @@ xfs_buftarg_init_streams(
 	struct xfs_buftarg	*btp,
 	unsigned int		nr_groups)
 {
-	return write_stream_pool_init(&btp->bt_stream_pool,
-			xfs_sw_write_stream_count(nr_groups));
+	unsigned int		nr_streams;
+
+	nr_streams = bdev_max_write_streams(btp->bt_bdev);
+	if (nr_streams) {
+		if (nr_groups)
+			nr_streams = min(nr_streams, nr_groups);
+		nr_streams = min(nr_streams, (unsigned int)U8_MAX);
+	} else {
+		nr_streams = xfs_sw_write_stream_count(nr_groups);
+	}
+
+	return write_stream_pool_init(&btp->bt_stream_pool, nr_streams);
 }
 
 /* Configure a buffer target that abstracts a block device. */

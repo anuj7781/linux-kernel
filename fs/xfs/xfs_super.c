@@ -591,9 +591,10 @@ xfs_setup_devices(
 		if (error)
 			return error;
 
-		if (xfs_has_rtgroups(mp) && !xfs_has_zoned(mp)) {
+		if (!xfs_has_zoned(mp)) {
 			error = xfs_buftarg_init_streams(mp->m_rtdev_targp,
-					mp->m_sb.sb_rgcount);
+					xfs_has_rtgroups(mp) ?
+					mp->m_sb.sb_rgcount : 0);
 			if (error)
 				return error;
 		}
