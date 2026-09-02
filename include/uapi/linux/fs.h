@@ -345,6 +345,23 @@ struct file_attr {
 /* Get logical block metadata capability details */
 #define FS_IOC_GETLBMD_CAP		_IOWR(0x15, 2, struct logical_block_metadata_cap)
 
+struct fs_write_stream_get_max {
+	__u32		max_streams;	/* OUT: number of available streams */
+	__u32		reserved;	/* OUT: zero */
+};
+
+struct fs_write_stream_set {
+	__s32		stream_fd;	/* IN: stream fd to assign */
+	__u32		reserved;	/* IN: must be zero */
+};
+
+/* ALLOC returns a stream fd as the ioctl return value. */
+#define FS_IOC_WRITE_STREAM_GET_MAX	\
+	_IOR('f', 135, struct fs_write_stream_get_max)
+#define FS_IOC_WRITE_STREAM_ALLOC	_IO('f', 136)
+#define FS_IOC_WRITE_STREAM_SET		\
+	_IOW('f', 137, struct fs_write_stream_set)
+
 /*
  * Inode flags (FS_IOC_GETFLAGS / FS_IOC_SETFLAGS)
  *
