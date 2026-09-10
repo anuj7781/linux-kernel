@@ -52,7 +52,9 @@ struct dma_buf_io_ctx {
 
 	atomic_t				fence_seq;
 	u64					fence_ctx;
+
 	struct work_struct			release_work;
+	struct work_struct			destroy_work;
 	refcount_t				refs;
 
 	void					*dev_priv;

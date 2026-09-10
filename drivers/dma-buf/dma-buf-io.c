@@ -25,7 +25,7 @@ const struct dma_fence_ops dma_buf_io_fence_ops = {
 static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 {
 	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
-						  release_work);
+						  destroy_work);
 
 	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
 		return;
@@ -33,6 +33,17 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 	ctx->dev_ops->release(ctx);
 	dma_buf_put(ctx->dmabuf);
 	kfree(ctx);
+}
+
+/*
+ * Drop a ctx reference, deferring the final free to a worker. Callers may be
+ * holding dma_resv, which ctx->dev_ops->release() -> dma_buf_detach() takes
+ * as well, so the free can never run inline from here.
+ */
+static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->refs))
+		queue_work(system_wq, &ctx->destroy_work);
 }
 
 static void dma_buf_io_map_release_work(struct work_struct *work)
@@ -65,14 +76,7 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	percpu_ref_exit(&map->refs);
 	kfree(map);
 
-	if (refcount_dec_and_test(&ctx->refs)) {
-		/*
-		 * Destruction needs to wait for I/O and dma fences. Defer it to
-		 * simplify locking.
-		 */
-		INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
-		queue_work(system_wq, &ctx->release_work);
-	}
+	dma_buf_io_ctx_put(ctx);
 }
 
 static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
@@ -219,17 +223,11 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
 	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
 		return;
 
-	if (refcount_dec_and_test(&ctx->refs))
-		dma_buf_io_ctx_destroy_work(&ctx->release_work);
+	dma_buf_io_ctx_put(ctx);
 }
 
 void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx)
 {
-	/*
-	 * Destruction needs to wait for I/O and dma fences. Defer it to
-	 * simplify locking.
-	 */
-	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
 	queue_work(system_wq, &ctx->release_work);
 }
 
@@ -248,6 +246,8 @@ int dma_buf_io_ctx_create(struct file *file,
 	ctx->dir = dir;
 	ctx->dmabuf = dmabuf;
 	refcount_set(&ctx->refs, 1);
+	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
+	INIT_WORK(&ctx->destroy_work, dma_buf_io_ctx_destroy_work);
 	get_dma_buf(dmabuf);
 
 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
