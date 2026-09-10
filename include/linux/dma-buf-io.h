@@ -34,6 +34,11 @@ struct dma_buf_io_map {
 	 * is deferred until all refs are dropped.
 	 */
 	struct percpu_ref		refs;
+
+	/*
+	 * DMA segment-length granularity, as a power-of-2 shift, for bounding
+	 * segments while splitting opaque dma-buf bios. Set by ->map().
+	 */
 	unsigned			seg_shift;
 
 	struct work_struct		release_work;
