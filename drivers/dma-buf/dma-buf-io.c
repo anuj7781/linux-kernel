@@ -7,16 +7,8 @@
 #include <linux/dma-buf-io.h>
 #include <linux/dma-resv.h>
 
-struct dma_buf_io_fence {
-	struct dma_fence base;
-	spinlock_t lock;
-};
-
 static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
 {
-	/* default fence release kfree's the base pointer */
-	BUILD_BUG_ON(offsetof(struct dma_buf_io_fence, base));
-
 	return "dma-buf-io-ctx";
 }
 
@@ -47,7 +39,7 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 {
 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
 						  release_work);
-	struct dma_buf_io_fence *fence = map->fence;
+	struct dma_fence *fence = map->fence;
 	struct dma_buf_io_ctx *ctx = map->ctx;
 	struct dma_buf *dmabuf = ctx->dmabuf;
 
@@ -63,13 +55,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	 * It should be done before taking the resv lock as someone could be
 	 * waiting for the fence while holding the lock.
 	 */
-	dma_fence_signal(&fence->base);
+	dma_fence_signal(fence);
 
 	dma_resv_lock(dmabuf->resv, NULL);
 	ctx->dev_ops->unmap(ctx, map);
 	dma_resv_unlock(dmabuf->resv);
 
-	dma_fence_put(&fence->base);
+	dma_fence_put(fence);
 	percpu_ref_exit(&map->refs);
 	kfree(map);
 
@@ -94,7 +86,7 @@ static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
 
 int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 {
-	struct dma_buf_io_fence *fence = NULL;
+	struct dma_fence *fence = NULL;
 	int ret;
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
@@ -107,9 +99,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 		return ret;
 	}
 
-	spin_lock_init(&fence->lock);
-	dma_fence_init(&fence->base, &dma_buf_io_fence_ops, &fence->lock,
-			ctx->fence_ctx, atomic_inc_return(&ctx->fence_seq));
+	dma_fence_init(fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
+		       atomic_inc_return(&ctx->fence_seq));
 	map->fence = fence;
 	map->ctx = ctx;
 	return 0;
@@ -185,7 +176,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 
 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
 	if (WARN_ON_ONCE(ret)) {
-		struct dma_fence *fence = &map->fence->base;
+		struct dma_fence *fence = map->fence;
 
 		dma_fence_get(fence);
 		percpu_ref_kill(&map->refs);
@@ -194,8 +185,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 		return;
 	}
 
-	dma_resv_add_fence(dmabuf->resv, &map->fence->base,
-			   DMA_RESV_USAGE_KERNEL);
+	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
 	/*
 	 * Delay destruction until all inflight requests using the map are
 	 * gone. It'll also signal the fence then.

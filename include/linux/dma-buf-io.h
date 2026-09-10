@@ -4,7 +4,6 @@
 
 #include <linux/dma-buf.h>
 
-struct dma_buf_io_fence;
 struct dma_buf_io_ctx;
 struct dma_buf_io_map;
 
@@ -42,7 +41,7 @@ struct dma_buf_io_map {
 	unsigned			seg_shift;
 
 	struct work_struct		release_work;
-	struct dma_buf_io_fence		*fence;
+	struct dma_fence		*fence;
 	struct dma_buf_io_ctx		*ctx;
 };
 
