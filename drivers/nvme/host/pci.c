@@ -427,6 +427,12 @@ enum nvme_iod_flags {
 
 	/* Metadata using non-coalesced MPTR */
 	IOD_SINGLE_META_SEGMENT	= 1U << 7,
+
+	/* Request holds map->active. */
+	IOD_DMABUF_ACTIVE	= 1U << 8,
+
+	/* Keep last; used to verify the flags field width. */
+	IOD_FLAGS_LAST,
 };
 
 struct nvme_dma_vec {
@@ -440,7 +446,7 @@ struct nvme_dma_vec {
 struct nvme_iod {
 	struct nvme_request req;
 	struct nvme_command cmd;
-	u8 flags;
+	u16 flags;
 	u8 nr_descriptors;
 
 	size_t total_len;
@@ -874,13 +880,50 @@ to_nvme_dmabuf_map(struct dma_buf_io_map *map)
 	return container_of(map, struct nvme_dmabuf_map, base);
 }
 
+#define NVME_STS_DMABUF_GENERATION_LOST	BLK_STS_IOERR
+
+static bool nvme_dmabuf_tryget_active(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	BUILD_BUG_ON((IOD_FLAGS_LAST - 1) > (typeof(iod->flags))~0U);
+
+	if (WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE))
+		return true;
+
+	if (!dma_buf_io_map_active_tryget(req->bio->bi_dmabuf_map))
+		return false;
+
+	iod->flags |= IOD_DMABUF_ACTIVE;
+	return true;
+}
+
+static void nvme_dmabuf_put_active(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	if (!(iod->flags & IOD_DMABUF_ACTIVE))
+		return;
+
+	iod->flags &= ~IOD_DMABUF_ACTIVE;
+	dma_buf_io_map_active_put(req->bio->bi_dmabuf_map);
+}
+
+static inline struct nvme_dmabuf_map *nvme_req_dmabuf_map(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	WARN_ON_ONCE(!(iod->flags & IOD_DMABUF_ACTIVE));
+	return to_nvme_dmabuf_map(req->bio->bi_dmabuf_map);
+}
+
 static void nvme_dmabuf_map_sync_for_cpu(struct nvme_dev *nvme_dev,
 					 struct request *req)
 {
 	struct device *dev = nvme_dev->dev;
 	enum dma_data_direction dma_dir;
 	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
 	dma_addr_t *dma_list = map->dma_list;
 	unsigned offset = bio->bi_iter.bi_offset;
 	unsigned map_idx = offset / NVME_CTRL_PAGE_SIZE;
@@ -902,7 +945,7 @@ static void nvme_dmabuf_map_sync_for_device(struct nvme_dev *nvme_dev,
 	struct device *dev = nvme_dev->dev;
 	enum dma_data_direction dma_dir;
 	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
 	dma_addr_t *dma_list = map->dma_list;
 	unsigned offset = bio->bi_iter.bi_offset;
 	unsigned map_idx = offset / NVME_CTRL_PAGE_SIZE;
@@ -927,6 +970,8 @@ static void nvme_rq_clean_dmabuf_map(struct nvme_dev *dev,
 
 	if (!(iod->flags & IOD_SINGLE_SEGMENT))
 		nvme_free_descriptors(req);
+
+	nvme_dmabuf_put_active(req);
 }
 
 static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
@@ -934,7 +979,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
 	unsigned bvec_done = bio->bi_iter.bi_offset;
 	unsigned map_idx = bvec_done / NVME_CTRL_PAGE_SIZE;
 	unsigned offset = bvec_done & (NVME_CTRL_PAGE_SIZE - 1);
@@ -964,8 +1009,10 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 
 	prp_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
 			&prp_dma);
-	if (!prp_list)
+	if (!prp_list) {
+		nvme_dmabuf_put_active(req);
 		return BLK_STS_RESOURCE;
+	}
 
 	iod->descriptors[iod->nr_descriptors++] = prp_list;
 	prp2_dma = prp_dma;
@@ -997,6 +1044,7 @@ done:
 	return BLK_STS_OK;
 free_prps:
 	nvme_free_descriptors(req);
+	nvme_dmabuf_put_active(req);
 	return BLK_STS_RESOURCE;
 }
 
@@ -1312,7 +1360,7 @@ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
 static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req)
 {
 	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
 	struct scatterlist *sg;
 	unsigned long tmp;
 	size_t offset = bio->bi_iter.bi_offset;
@@ -1352,7 +1400,7 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
 	size_t length = blk_rq_payload_bytes(req);
 	struct nvme_sgl_desc *sg_list = &iod->cmd.common.dptr.sgl;
 	bool pooled = entries > 1;
@@ -1363,8 +1411,10 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 	size_t offset = bio->bi_iter.bi_offset;
 	size_t remaining = length;
 
-	if (!entries)
+	if (!entries) {
+		nvme_dmabuf_put_active(req);
 		return BLK_STS_IOERR;
+	}
 
 	iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
 	iod->total_len = length;
@@ -1378,8 +1428,10 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 
 		sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
 					 &sgl_dma);
-		if (!sg_list)
+		if (!sg_list) {
+			nvme_dmabuf_put_active(req);
 			return BLK_STS_RESOURCE;
+		}
 		iod->descriptors[iod->nr_descriptors++] = sg_list;
 	}
 
@@ -1423,6 +1475,7 @@ err_free:
 		iod->nr_descriptors--;
 		dma_pool_free(nvme_dma_pool(nvmeq, iod), sg_list, sgl_dma);
 	}
+	nvme_dmabuf_put_active(req);
 	return BLK_STS_IOERR;
 }
 
@@ -1431,6 +1484,9 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
 {
 	unsigned int entries;
 	size_t avg_seg;
+
+	if (!nvme_dmabuf_tryget_active(req))
+		return NVME_STS_DMABUF_GENERATION_LOST;
 
 	if (use_sgl == SGL_UNSUPPORTED)
 		return nvme_rq_setup_dmabuf_map(req, nvmeq);
@@ -1773,18 +1829,19 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
 	spin_unlock(&nvmeq->sq_lock);
 }
 
-static bool nvme_prep_rq_batch(struct nvme_queue *nvmeq, struct request *req)
+static blk_status_t nvme_prep_rq_batch(struct nvme_queue *nvmeq,
+				       struct request *req)
 {
 	/*
 	 * We should not need to do this, but we're still using this to
 	 * ensure we can drain requests on a dying queue.
 	 */
 	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
-		return false;
+		return BLK_STS_DEV_RESOURCE;
 	if (unlikely(!nvme_check_ready(&nvmeq->dev->ctrl, req, true)))
-		return false;
+		return BLK_STS_DEV_RESOURCE;
 
-	return nvme_prep_rq(req) == BLK_STS_OK;
+	return nvme_prep_rq(req);
 }
 
 static void nvme_queue_rqs(struct rq_list *rqlist)
@@ -1795,14 +1852,26 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
 	struct request *req;
 
 	while ((req = rq_list_pop(rqlist))) {
+		blk_status_t ret;
+
 		if (nvmeq && nvmeq != req->mq_hctx->driver_data)
 			nvme_submit_cmds(nvmeq, &submit_list);
 		nvmeq = req->mq_hctx->driver_data;
 
-		if (nvme_prep_rq_batch(nvmeq, req))
+		ret = nvme_prep_rq_batch(nvmeq, req);
+		switch (ret) {
+		case BLK_STS_OK:
 			rq_list_add_tail(&submit_list, req);
-		else
+			break;
+		case BLK_STS_RESOURCE:
+		case BLK_STS_DEV_RESOURCE:
 			rq_list_add_tail(&requeue_list, req);
+			break;
+		default:
+			/* Generation loss is terminal, not a resource retry. */
+			blk_mq_end_request(req, ret);
+			break;
+		}
 	}
 
 	if (nvmeq)
