@@ -34,8 +34,9 @@ struct dma_buf_io_map {
 	struct kref			refs;
 
 	/*
-	 * Gates DMA-map access. Killed on invalidation and drained before
-	 * ->unmap().
+	 * Gates DMA-map access from hardware submission through completion.
+	 * Holders must not perform reclaim-capable allocations.
+	 * Killed on invalidation and drained before ->unmap().
 	 */
 	struct percpu_ref		active;
 
@@ -90,6 +91,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
 	percpu_ref_put(&map->active);
 }
 
+/* This acquires only a software reference; active is driver-managed. */
 static inline struct dma_buf_io_map *
 dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
 {
@@ -100,17 +102,12 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
 	map = rcu_dereference(ctx->map);
 	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
 		return NULL;
-	if (unlikely(!dma_buf_io_map_active_tryget(map))) {
-		kref_put(&map->refs, __dma_buf_io_map_free);
-		return NULL;
-	}
 
 	return map;
 }
 
 static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
 {
-	dma_buf_io_map_active_put(map);
 	kref_put(&map->refs, __dma_buf_io_map_free);
 }
 

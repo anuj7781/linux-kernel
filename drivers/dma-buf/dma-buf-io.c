@@ -172,7 +172,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 
 	/* Return a caller reference in addition to the publication reference. */
 	kref_get(&map->refs);
-	percpu_ref_get(&map->active);
 	rcu_assign_pointer(ctx->map, map);
 out:
 	dma_resv_unlock(dmabuf->resv);
