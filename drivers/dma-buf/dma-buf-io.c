@@ -8,6 +8,9 @@
 #include <linux/dma-resv.h>
 #include <linux/file.h>
 
+/* Keep deferred unmap work available under memory pressure. */
+static struct workqueue_struct *dma_buf_io_wq;
+
 static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
 {
 	return "dma-buf-io-ctx";
@@ -94,7 +97,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
 
 	dma_fence_signal(map->fence);
 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
-	queue_work(system_wq, &map->release_work);
+	queue_work(dma_buf_io_wq, &map->release_work);
 }
 
 int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
@@ -291,3 +294,12 @@ int dma_buf_io_ctx_create(struct file *file,
 
 	return ret;
 }
+
+static int __init dma_buf_io_init(void)
+{
+	dma_buf_io_wq = alloc_workqueue("dma_buf_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!dma_buf_io_wq)
+		return -ENOMEM;
+	return 0;
+}
+subsys_initcall(dma_buf_io_init);
