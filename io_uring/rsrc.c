@@ -1280,6 +1280,20 @@ void io_drop_dmabuf_node(struct io_kiocb *req)
 	req->flags &= ~REQ_F_DROP_DMABUF;
 }
 
+/* Reuse the cached map only while it is still the current generation. */
+static struct dma_buf_io_map *io_dmabuf_reuse_map(struct io_kiocb *req,
+						  struct io_regbuf_dma *db)
+{
+	struct dma_buf_io_map *map = req->dmabuf_map;
+
+	if (likely(rcu_access_pointer(db->ctx.map) == map))
+		return map;
+
+	dma_buf_io_map_drop(map);
+	req->flags &= ~REQ_F_DROP_DMABUF;
+	return NULL;
+}
+
 static int io_import_dmabuf(struct io_kiocb *req,
 			   int ddir, struct iov_iter *iter,
 			   struct io_mapped_ubuf *imu,
@@ -1287,7 +1301,7 @@ static int io_import_dmabuf(struct io_kiocb *req,
 			   unsigned issue_flags)
 {
 	struct io_regbuf_dma *db = imu->priv;
-	struct dma_buf_io_map *map;
+	struct dma_buf_io_map *map = NULL;
 
 	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
 		return -EOPNOTSUPP;
@@ -1297,8 +1311,9 @@ static int io_import_dmabuf(struct io_kiocb *req,
 		return -EBADF;
 
 	if (req->flags & REQ_F_DROP_DMABUF) {
-		map = req->dmabuf_map;
-		goto init_iter;
+		map = io_dmabuf_reuse_map(req, db);
+		if (map)
+			goto init_iter;
 	}
 
 	map = dma_buf_io_get_map(&db->ctx);
