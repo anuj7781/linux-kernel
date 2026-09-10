@@ -113,19 +113,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 	struct dma_buf_io_map *map;
 	long ret;
 
-retry:
-	/*
-	 * ->dmabuf_map() will be calling dma_buf_map_attachment(), for which
-	 * we'll need to wait for fences. Do a bit nicer and try to wait
-	 * without the resv lock first.
-	 */
-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
-				    true, MAX_SCHEDULE_TIMEOUT);
-	if (!ret)
-		ret = -EAGAIN;
-	if (ret < 0)
-		return ERR_PTR(ret);
-
 	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
 	if (ret)
 		return ERR_PTR(ret);
@@ -136,11 +123,17 @@ retry:
 		goto out;
 	}
 
-	if (dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
-				  true, 0) < 0) {
-		dma_resv_unlock(dmabuf->resv);
-		goto retry;
-	}
+	/*
+	 * ->map() will call dma_buf_map_attachment(), which requires the
+	 * exporter's outstanding fences to have retired first. Wait here,
+	 * under the reservation lock.
+	 */
+	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL, true,
+				    MAX_SCHEDULE_TIMEOUT);
+	if (ret == 0)
+		ret = -ETIMEDOUT;
+	if (ret < 0)
+		goto out;
 
 	map = ctx->dev_ops->map(ctx);
 	if (IS_ERR(map)) {
