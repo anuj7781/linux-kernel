@@ -6,6 +6,7 @@
  */
 #include <linux/dma-buf-io.h>
 #include <linux/dma-resv.h>
+#include <linux/file.h>
 
 static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
 {
@@ -26,6 +27,7 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 {
 	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
 						  destroy_work);
+	struct file *file = ctx->file;
 
 	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
 		return;
@@ -33,6 +35,7 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 	ctx->dev_ops->release(ctx);
 	dma_buf_put(ctx->dmabuf);
 	kfree(ctx);
+	fput(file);
 }
 
 /*
@@ -249,11 +252,13 @@ int dma_buf_io_ctx_create(struct file *file,
 	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
 	INIT_WORK(&ctx->destroy_work, dma_buf_io_ctx_destroy_work);
 	get_dma_buf(dmabuf);
+	ctx->file = get_file(file);
 
 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
 	if (ret) {
 		memset(ctx, 0, sizeof(*ctx));
 		dma_buf_put(dmabuf);
+		fput(file);
 		return ret;
 	}
 
@@ -265,6 +270,7 @@ int dma_buf_io_ctx_create(struct file *file,
 			ctx->dev_ops->release(ctx);
 		memset(ctx, 0, sizeof(*ctx));
 		dma_buf_put(dmabuf);
+		fput(file);
 		return -EINVAL;
 	}
 

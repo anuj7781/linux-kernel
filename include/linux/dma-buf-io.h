@@ -57,6 +57,9 @@ struct dma_buf_io_ctx {
 	struct work_struct			destroy_work;
 	refcount_t				refs;
 
+	/* Pinned until ->release() detaches the target device. */
+	struct file				*file;
+
 	void					*dev_priv;
 	const struct dma_buf_io_ops		*dev_ops;
 };
