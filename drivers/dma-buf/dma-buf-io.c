@@ -260,8 +260,13 @@ int dma_buf_io_ctx_create(struct file *file,
 	if (WARN_ON_ONCE(!ctx->dev_ops ||
 			 !ctx->dev_ops->map ||
 			 !ctx->dev_ops->unmap ||
-			 !ctx->dev_ops->release))
+			 !ctx->dev_ops->release)) {
+		if (ctx->dev_ops && ctx->dev_ops->release)
+			ctx->dev_ops->release(ctx);
+		memset(ctx, 0, sizeof(*ctx));
+		dma_buf_put(dmabuf);
 		return -EINVAL;
+	}
 
 	return ret;
 }
