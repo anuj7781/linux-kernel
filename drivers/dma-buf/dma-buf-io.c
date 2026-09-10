@@ -75,13 +75,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	struct dma_buf_io_ctx *ctx = map->ctx;
 	struct dma_buf *dmabuf = ctx->dmabuf;
 
-	/*
-	 * There are no more requests using the map, we can signal the fence.
-	 * It should be done before taking the resv lock as someone could be
-	 * waiting for the fence while holding the lock.
-	 */
-	dma_fence_signal(fence);
-
 	dma_resv_lock(dmabuf->resv, NULL);
 	ctx->dev_ops->unmap(ctx, map);
 	dma_resv_unlock(dmabuf->resv);
@@ -94,7 +87,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
 {
 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
 
-	/* might sleep, use a worker */
+	dma_fence_signal(map->fence);
 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
 	queue_work(system_wq, &map->release_work);
 }
@@ -206,10 +199,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 	}
 
 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
-	/*
-	 * Delay destruction until all inflight requests using the map are
-	 * gone. It'll also signal the fence then.
-	 */
+	/* Delay unmap until all active users are gone. */
 	percpu_ref_kill(&map->active);
 }
 
