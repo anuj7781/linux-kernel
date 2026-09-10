@@ -148,8 +148,14 @@ retry:
 		goto out;
 	}
 
-	if (WARN_ON_ONCE(!map->seg_shift))
-		return ERR_PTR(-EFAULT);
+	if (WARN_ON_ONCE(!map->seg_shift)) {
+		ctx->dev_ops->unmap(ctx, map);
+		dma_fence_put(map->fence);
+		percpu_ref_exit(&map->refs);
+		kfree(map);
+		ret = -EFAULT;
+		goto out;
+	}
 
 	percpu_ref_get(&map->refs);
 	rcu_assign_pointer(ctx->map, map);
