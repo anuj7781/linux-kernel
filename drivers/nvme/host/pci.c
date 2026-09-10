@@ -2617,8 +2617,10 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
 		}
 	}
 
-	if (WARN_ON_ONCE(seg_shift < NVME_CTRL_PAGE_SHIFT))
-		return ERR_PTR(-EFAULT);
+	if (WARN_ON_ONCE(seg_shift < NVME_CTRL_PAGE_SHIFT)) {
+		ret = -EFAULT;
+		goto err;
+	}
 
 	ret = dma_buf_io_init_map(ctx, &map->base);
 	if (ret)
