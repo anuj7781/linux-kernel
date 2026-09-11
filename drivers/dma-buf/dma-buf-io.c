@@ -54,6 +54,7 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
 	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
 	struct dma_buf_io_ctx *ctx = map->ctx;
 
+	percpu_ref_exit(&map->active);
 	kfree(map);
 	dma_buf_io_ctx_put(ctx);
 }
@@ -86,7 +87,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	dma_resv_unlock(dmabuf->resv);
 
 	dma_fence_put(fence);
-	percpu_ref_exit(&map->active);
 	kref_put(&map->refs, __dma_buf_io_map_free);
 }
 
