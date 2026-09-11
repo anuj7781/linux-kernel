@@ -57,13 +57,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	struct dma_buf_io_ctx *ctx = map->ctx;
 	struct dma_buf *dmabuf = ctx->dmabuf;
 
-	/* the release path must wait for fences */
-	if (WARN_ON_ONCE(refcount_read(&ctx->refs) == 0))
-		return;
-
-	/* Prevent from destoying the ctx while unmapping */
-	refcount_inc(&ctx->refs);
-
 	/*
 	 * There are no more requests using the map, we can signal the fence.
 	 * It should be done before taking the resv lock as someone could be
@@ -110,6 +103,9 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 		       atomic_inc_return(&ctx->fence_seq));
 	map->fence = fence;
 	map->ctx = ctx;
+
+	/* The map owns a ctx reference until deferred teardown completes. */
+	refcount_inc(&ctx->refs);
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_io_init_map, "DMA_BUF");
@@ -153,6 +149,7 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 		dma_fence_put(map->fence);
 		percpu_ref_exit(&map->refs);
 		kfree(map);
+		dma_buf_io_ctx_put(ctx);
 		ret = -EFAULT;
 		goto out;
 	}
