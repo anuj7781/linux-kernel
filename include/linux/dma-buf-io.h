@@ -3,6 +3,8 @@
 #define __DMA_BUF_IO_H__
 
 #include <linux/dma-buf.h>
+#include <linux/kref.h>
+#include <linux/rcupdate.h>
 
 struct dma_buf_io_ctx;
 struct dma_buf_io_map;
@@ -28,11 +30,14 @@ struct dma_buf_io_ops {
 };
 
 struct dma_buf_io_map {
+	/* Keeps the map and map->ctx alive for software pointer holders. */
+	struct kref			refs;
+
 	/*
-	 * Counts attached requests and other users. Device specific unmapping
-	 * is deferred until all refs are dropped.
+	 * Gates DMA-map access. Killed on invalidation and drained before
+	 * ->unmap().
 	 */
-	struct percpu_ref		refs;
+	struct percpu_ref		active;
 
 	/*
 	 * DMA segment-length granularity, as a power-of-2 shift, for bounding
@@ -43,6 +48,7 @@ struct dma_buf_io_map {
 	struct work_struct		release_work;
 	struct dma_fence		*fence;
 	struct dma_buf_io_ctx		*ctx;
+	struct rcu_head			rcu;
 };
 
 struct dma_buf_io_ctx {
@@ -72,6 +78,18 @@ void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx);
 
 struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx);
 
+void __dma_buf_io_map_free(struct kref *kref);
+
+static inline bool dma_buf_io_map_active_tryget(struct dma_buf_io_map *map)
+{
+	return percpu_ref_tryget_live(&map->active);
+}
+
+static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
+{
+	percpu_ref_put(&map->active);
+}
+
 static inline struct dma_buf_io_map *
 dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
 {
@@ -80,15 +98,20 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
 	guard(rcu)();
 
 	map = rcu_dereference(ctx->map);
-	if (unlikely(!map || !percpu_ref_tryget_live_rcu(&map->refs)))
+	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
 		return NULL;
+	if (unlikely(!dma_buf_io_map_active_tryget(map))) {
+		kref_put(&map->refs, __dma_buf_io_map_free);
+		return NULL;
+	}
 
 	return map;
 }
 
 static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
 {
-	percpu_ref_put(&map->refs);
+	dma_buf_io_map_active_put(map);
+	kref_put(&map->refs, __dma_buf_io_map_free);
 }
 
 /*

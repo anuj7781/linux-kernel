@@ -49,6 +49,23 @@ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
 		queue_work(system_wq, &ctx->destroy_work);
 }
 
+static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+{
+	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+	struct dma_buf_io_ctx *ctx = map->ctx;
+
+	kfree(map);
+	dma_buf_io_ctx_put(ctx);
+}
+
+void __dma_buf_io_map_free(struct kref *kref)
+{
+	struct dma_buf_io_map *map = container_of(kref, struct dma_buf_io_map, refs);
+
+	call_rcu(&map->rcu, dma_buf_io_map_free_rcu);
+}
+EXPORT_SYMBOL_NS_GPL(__dma_buf_io_map_free, "DMA_BUF");
+
 static void dma_buf_io_map_release_work(struct work_struct *work)
 {
 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
@@ -69,15 +86,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	dma_resv_unlock(dmabuf->resv);
 
 	dma_fence_put(fence);
-	percpu_ref_exit(&map->refs);
-	kfree(map);
-
-	dma_buf_io_ctx_put(ctx);
+	percpu_ref_exit(&map->active);
+	kref_put(&map->refs, __dma_buf_io_map_free);
 }
 
-static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
+static void dma_buf_io_map_active_release(struct percpu_ref *ref)
 {
-	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, refs);
+	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
 
 	/* might sleep, use a worker */
 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
@@ -93,7 +108,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 	if (!fence)
 		return -ENOMEM;
 
-	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_release, 0, GFP_KERNEL);
+	ret = percpu_ref_init(&map->active, dma_buf_io_map_active_release, 0,
+			      GFP_KERNEL);
 	if (ret) {
 		kfree(fence);
 		return ret;
@@ -103,8 +119,9 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 		       atomic_inc_return(&ctx->fence_seq));
 	map->fence = fence;
 	map->ctx = ctx;
+	kref_init(&map->refs);
 
-	/* The map owns a ctx reference until deferred teardown completes. */
+	/* Keep ctx alive until the map's final release. */
 	refcount_inc(&ctx->refs);
 	return 0;
 }
@@ -147,14 +164,15 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 	if (WARN_ON_ONCE(!map->seg_shift)) {
 		ctx->dev_ops->unmap(ctx, map);
 		dma_fence_put(map->fence);
-		percpu_ref_exit(&map->refs);
-		kfree(map);
-		dma_buf_io_ctx_put(ctx);
+		percpu_ref_exit(&map->active);
+		kref_put(&map->refs, __dma_buf_io_map_free);
 		ret = -EFAULT;
 		goto out;
 	}
 
-	percpu_ref_get(&map->refs);
+	/* Return a caller reference in addition to the publication reference. */
+	kref_get(&map->refs);
+	percpu_ref_get(&map->active);
 	rcu_assign_pointer(ctx->map, map);
 out:
 	dma_resv_unlock(dmabuf->resv);
@@ -182,7 +200,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 		struct dma_fence *fence = map->fence;
 
 		dma_fence_get(fence);
-		percpu_ref_kill(&map->refs);
+		percpu_ref_kill(&map->active);
 		dma_fence_wait(fence, false);
 		dma_fence_put(fence);
 		return;
@@ -193,7 +211,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 	 * Delay destruction until all inflight requests using the map are
 	 * gone. It'll also signal the fence then.
 	 */
-	percpu_ref_kill(&map->refs);
+	percpu_ref_kill(&map->active);
 }
 
 void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
