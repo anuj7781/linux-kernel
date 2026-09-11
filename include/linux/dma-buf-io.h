@@ -2,12 +2,18 @@
 #ifndef __DMA_BUF_IO_H__
 #define __DMA_BUF_IO_H__
 
+#include <linux/completion.h>
 #include <linux/dma-buf.h>
 #include <linux/kref.h>
 #include <linux/rcupdate.h>
 
 struct dma_buf_io_ctx;
 struct dma_buf_io_map;
+
+enum dma_buf_io_release_mode {
+	DMA_BUF_IO_RELEASE_FENCED,
+	DMA_BUF_IO_RELEASE_SYNC,
+};
 
 struct dma_buf_io_ops {
 	/*
@@ -46,7 +52,10 @@ struct dma_buf_io_map {
 	 */
 	unsigned			seg_shift;
 
+	enum dma_buf_io_release_mode	release_mode;
+
 	struct work_struct		release_work;
+	struct completion		drain;
 	struct dma_fence		*fence;
 	struct dma_buf_io_ctx		*ctx;
 	struct rcu_head			rcu;

@@ -87,6 +87,11 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
 {
 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
 
+	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
+		complete(&map->drain);
+		return;
+	}
+
 	dma_fence_signal(map->fence);
 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
 	queue_work(system_wq, &map->release_work);
@@ -108,11 +113,10 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 		return ret;
 	}
 
-	dma_fence_init(fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
-		       atomic_inc_return(&ctx->fence_seq));
 	map->fence = fence;
 	map->ctx = ctx;
 	kref_init(&map->refs);
+	init_completion(&map->drain);
 
 	/* Keep ctx alive until the map's final release. */
 	refcount_inc(&ctx->refs);
@@ -156,7 +160,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 
 	if (WARN_ON_ONCE(!map->seg_shift)) {
 		ctx->dev_ops->unmap(ctx, map);
-		dma_fence_put(map->fence);
+		/* The fence has not been initialized. */
+		kfree(map->fence);
 		percpu_ref_exit(&map->active);
 		kref_put(&map->refs, __dma_buf_io_map_free);
 		ret = -EFAULT;
@@ -189,16 +194,22 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 
 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
 	if (WARN_ON_ONCE(ret)) {
-		struct dma_fence *fence = map->fence;
-
-		dma_fence_get(fence);
+		/* No fence can be published, so drain synchronously. */
+		map->release_mode = DMA_BUF_IO_RELEASE_SYNC;
 		percpu_ref_kill(&map->active);
-		dma_fence_wait(fence, false);
-		dma_fence_put(fence);
+		wait_for_completion(&map->drain);
+
+		ctx->dev_ops->unmap(ctx, map);
+		kfree(map->fence);
+		map->fence = NULL;
+		kref_put(&map->refs, __dma_buf_io_map_free);
 		return;
 	}
 
+	dma_fence_init(map->fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
+		       atomic_inc_return(&ctx->fence_seq));
 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
+	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
 	/* Delay unmap until all active users are gone. */
 	percpu_ref_kill(&map->active);
 }
