@@ -25,7 +25,7 @@ const struct dma_fence_ops dma_buf_io_fence_ops = {
 static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 {
 	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
-						  release_work);
+						  destroy_work);
 
 	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
 		return;
@@ -35,6 +35,34 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
 	kfree(ctx);
 }
 
+/*
+ * Drop a ctx reference, deferring the final free to a worker. Callers may be
+ * holding dma_resv, which ctx->dev_ops->release() -> dma_buf_detach() takes
+ * as well, so the free can never run inline from here.
+ */
+static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->refs))
+		queue_work(system_wq, &ctx->destroy_work);
+}
+
+static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+{
+	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+	struct dma_buf_io_ctx *ctx = map->ctx;
+
+	kfree(map);
+	dma_buf_io_ctx_put(ctx);
+}
+
+void __dma_buf_io_map_free(struct kref *kref)
+{
+	struct dma_buf_io_map *map = container_of(kref, struct dma_buf_io_map, refs);
+
+	call_rcu(&map->rcu, dma_buf_io_map_free_rcu);
+}
+EXPORT_SYMBOL_NS_GPL(__dma_buf_io_map_free, "DMA_BUF");
+
 static void dma_buf_io_map_release_work(struct work_struct *work)
 {
 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
@@ -42,13 +70,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	struct dma_fence *fence = map->fence;
 	struct dma_buf_io_ctx *ctx = map->ctx;
 	struct dma_buf *dmabuf = ctx->dmabuf;
-
-	/* the release path must wait for fences */
-	if (WARN_ON_ONCE(refcount_read(&ctx->refs) == 0))
-		return;
-
-	/* Prevent from destoying the ctx while unmapping */
-	refcount_inc(&ctx->refs);
 
 	/*
 	 * There are no more requests using the map, we can signal the fence.
@@ -62,22 +83,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
 	dma_resv_unlock(dmabuf->resv);
 
 	dma_fence_put(fence);
-	percpu_ref_exit(&map->refs);
-	kfree(map);
-
-	if (refcount_dec_and_test(&ctx->refs)) {
-		/*
-		 * Destruction needs to wait for I/O and dma fences. Defer it to
-		 * simplify locking.
-		 */
-		INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
-		queue_work(system_wq, &ctx->release_work);
-	}
+	percpu_ref_exit(&map->active);
+	kref_put(&map->refs, __dma_buf_io_map_free);
 }
 
-static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
+static void dma_buf_io_map_active_release(struct percpu_ref *ref)
 {
-	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, refs);
+	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
 
 	/* might sleep, use a worker */
 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
@@ -93,7 +105,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 	if (!fence)
 		return -ENOMEM;
 
-	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_release, 0, GFP_KERNEL);
+	ret = percpu_ref_init(&map->active, dma_buf_io_map_active_release, 0,
+			      GFP_KERNEL);
 	if (ret) {
 		kfree(fence);
 		return ret;
@@ -103,6 +116,10 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
 		       atomic_inc_return(&ctx->fence_seq));
 	map->fence = fence;
 	map->ctx = ctx;
+	kref_init(&map->refs);
+
+	/* Keep ctx alive until the map's final release. */
+	refcount_inc(&ctx->refs);
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_io_init_map, "DMA_BUF");
@@ -141,10 +158,18 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
 		goto out;
 	}
 
-	if (WARN_ON_ONCE(!map->seg_shift))
-		return ERR_PTR(-EFAULT);
+	if (WARN_ON_ONCE(!map->seg_shift)) {
+		ctx->dev_ops->unmap(ctx, map);
+		dma_fence_put(map->fence);
+		percpu_ref_exit(&map->active);
+		kref_put(&map->refs, __dma_buf_io_map_free);
+		ret = -EFAULT;
+		goto out;
+	}
 
-	percpu_ref_get(&map->refs);
+	/* Return a caller reference in addition to the publication reference. */
+	kref_get(&map->refs);
+	percpu_ref_get(&map->active);
 	rcu_assign_pointer(ctx->map, map);
 out:
 	dma_resv_unlock(dmabuf->resv);
@@ -172,7 +197,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 		struct dma_fence *fence = map->fence;
 
 		dma_fence_get(fence);
-		percpu_ref_kill(&map->refs);
+		percpu_ref_kill(&map->active);
 		dma_fence_wait(fence, false);
 		dma_fence_put(fence);
 		return;
@@ -183,7 +208,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
 	 * Delay destruction until all inflight requests using the map are
 	 * gone. It'll also signal the fence then.
 	 */
-	percpu_ref_kill(&map->refs);
+	percpu_ref_kill(&map->active);
 }
 
 void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
@@ -213,17 +238,11 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
 	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
 		return;
 
-	if (refcount_dec_and_test(&ctx->refs))
-		dma_buf_io_ctx_destroy_work(&ctx->release_work);
+	dma_buf_io_ctx_put(ctx);
 }
 
 void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx)
 {
-	/*
-	 * Destruction needs to wait for I/O and dma fences. Defer it to
-	 * simplify locking.
-	 */
-	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
 	queue_work(system_wq, &ctx->release_work);
 }
 
@@ -242,6 +261,8 @@ int dma_buf_io_ctx_create(struct file *file,
 	ctx->dir = dir;
 	ctx->dmabuf = dmabuf;
 	refcount_set(&ctx->refs, 1);
+	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
+	INIT_WORK(&ctx->destroy_work, dma_buf_io_ctx_destroy_work);
 	get_dma_buf(dmabuf);
 
 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
